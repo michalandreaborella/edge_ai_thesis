@@ -1,0 +1,14 @@
+torch>=2.0.0
+torchvision>=0.15.0
+psutil
+pandas
+Pillow
+tqdm
+onnx
+onnxscript
+onnxruntime
+torchmetrics
+tensorflow
+pycocotools
+mosquitto
+
