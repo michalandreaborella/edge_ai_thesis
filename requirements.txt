@@ -3,6 +3,7 @@ torchvision>=0.15.0
 psutil
 pandas
 Pillow
+opencv-python
 tqdm
 onnx
 onnxscript
@@ -10,5 +11,7 @@ onnxruntime
 torchmetrics
 tensorflow
 pycocotools
-mosquitto
-
+paho-mqtt
+openvino
+openvino-dev
+kinara-runtime
