@@ -1,118 +1,158 @@
 import time
 import os
-import psutil
-import torch
-import numpy as np
-import torchvision.transforms as T
-from tqdm import tqdm
-from torchmetrics.detection.mean_ap import MeanAveragePrecision
-from torch.utils.data import DataLoader
 import sys
+import psutil
+import numpy as np
+import torch
+import torchvision
+import torchvision.transforms as T
+from torch.utils.data import DataLoader
+
+# 1. FIX: Import compatibile con la Jetson (TorchMetrics 0.7.3)
+from torchmetrics.detection.map import MAP
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src_training.train_m1 import NEUDETDataset, collate_fn
 
+# 2. FIX: Risoluzione incollata a 200x200 (come l'ONNX Statico) per non esplodere a 5W
+FIXED_INPUT_SIZE = (200, 200)
 
 def measure_system_metrics():
-    process = psutil.Process(os.getpid())
-    ram_mb = process.memory_info().rss / (1024 * 1024)
+    process  = psutil.Process(os.getpid())
+    ram_mb   = process.memory_info().rss / (1024 * 1024)
     cpu_load = psutil.cpu_percent(interval=None)
     return ram_mb, cpu_load
 
+def _resize_tensor(img_tensor: torch.Tensor) -> np.ndarray:
+    """Ridimensiona a 200x200 e converte per ONNX"""
+    h, w = FIXED_INPUT_SIZE
+    resized = T.functional.resize(img_tensor, [h, w])
+    return resized.unsqueeze(0).numpy()
 
-def run_benchmark(model_path, data_root, hw_name="Nvidia_Jetson_Nano", tdp_w=10.0):
-    is_onnx = model_path.endswith('.onnx')
-    format_name = "ONNX (CUDA)" if is_onnx else "PyTorch Nativo"
+def run_benchmark(model_path: str, data_root: str,
+                  hw_name: str = "Nvidia_Jetson_Nano", tdp_w: float = 5.0): # TDP settato a 5W reali
+    is_onnx     = model_path.endswith('.onnx')
+    format_name = "ONNX Statico (CUDA)" if is_onnx else "PyTorch Nativo"
 
-    print(f"\n[*] INIZIALIZZAZIONE BENCHMARK - {format_name}")
-    print("=" * 60)
+    print(f"\n[*] BENCHMARK — {format_name}  |  Hardware: {hw_name} (5 Watt)")
+    print("=" * 65)
 
-    # 1. Caricamento Dataset
-    print("[*] Caricamento Dataset NEU-DET...")
-    val_dataset = NEUDETDataset(root_dir=data_root, split='validation', transforms=T.Compose([T.ToTensor()]))
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate_fn)
+    print("[1] Caricamento dataset NEU-DET...")
+    val_dataset = NEUDETDataset(
+        root_dir=data_root, split='val',
+        transforms=T.Compose([T.ToTensor()])
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=1, shuffle=False,
+        num_workers=0, collate_fn=collate_fn
+    )
     test_img, _ = val_dataset[0]
 
-    # 2. Inizializzazione Modello
     if is_onnx:
         import onnxruntime as ort
-        print("[*] Avvio Motore ONNX con CUDAExecutionProvider...")
-        # Limito la memoria CUDA per evitare esplosioni RAM
-        provider_options = [
-            {'device_id': 0, 'arena_extend_strategy': 'kNextPowerOfTwo', 'gpu_mem_limit': 2 * 1024 * 1024 * 1024}]
-        session = ort.InferenceSession(model_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
-                                       provider_options=provider_options)
+        print("[2] Inizializzazione ONNX Runtime (CUDA)...")
+        # FIX: Niente provider_options complesse. Usa le variabili d'ambiente di sicurezza che passiamo da terminale.
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        session = ort.InferenceSession(model_path, providers=providers)
         input_name = session.get_inputs()[0].name
-        test_input = np.expand_dims(test_img.numpy(), axis=0)
+        test_input_np = _resize_tensor(test_img)
+
+        def run_once():
+            session.run(None, {input_name: test_input_np})
+
     else:
-        print("[*] Avvio Modello PyTorch...")
+        print("[2] Inizializzazione modello PyTorch Legacy...")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model = torch.load(model_path, map_location=device)
-        model.eval()
-        test_input = [test_img.to(device)]
+        checkpoint = torch.load(model_path, map_location=device)
 
-    # --- FASE 1: VELOCITÀ ---
-    print("\n[*] FASE 1: Warmup e Velocità...")
-    iterations = 50
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint))
+            # FIX: Comando legacy compatibile con PyTorch 1.8
+            model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=False, pretrained_backbone=False)
+            in_features = model.roi_heads.box_predictor.cls_score.in_features
+            model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 7)
+            model.load_state_dict(state_dict)
+        else:
+            model = checkpoint
+
+        model.to(device).eval()
+
+        # Test input per PyTorch deve essere ridimensionato per un confronto equo!
+        h, w = FIXED_INPUT_SIZE
+        resized_pt = T.functional.resize(test_img, [h, w]).to(device)
+        test_input_pt = [resized_pt]
+
+        def run_once():
+            with torch.no_grad():
+                model(test_input_pt)
+
+    print("\n[3] Warmup (10 iterazioni)...")
     with torch.no_grad():
-        for _ in range(5):  # Warmup ridotto a 5 per salvare memoria
-            if is_onnx:
-                session.run(None, {input_name: test_input})
-            else:
-                model(test_input)
+        for _ in range(10):
+            run_once()
 
+    if not is_onnx and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    iterations = 50
     psutil.cpu_percent(interval=1)
-    start_time = time.time()
+
+    print(f"[3] Timing di velocità ({iterations} iterazioni)...")
+    t0 = time.perf_counter()
     with torch.no_grad():
         for _ in range(iterations):
-            if is_onnx:
-                session.run(None, {input_name: test_input})
-            else:
-                model(test_input)
-    end_time = time.time()
+            run_once()
 
-    ram_peak_mb, cpu_overhead = measure_system_metrics()
-    avg_latency_ms = ((end_time - start_time) / iterations) * 1000
-    fps = 1000 / avg_latency_ms
-    inf_per_watt = fps / tdp_w
+    if not is_onnx and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
 
-    # --- FASE 2: ACCURATEZZA ---
-    print("\n[*] FASE 2: Calcolo mAP@50...")
-    metric = MeanAveragePrecision()
+    ram_mb, cpu_pct        = measure_system_metrics()
+    avg_latency_ms         = ((t1 - t0) / iterations) * 1000
+    fps                    = 1000.0 / avg_latency_ms
+    inf_per_watt           = fps / tdp_w
+
+    print("\n[4] Calcolo mAP@50 su val set...")
+    # FIX: Sintassi corretta per torchmetrics 0.7.3
+    metric = MAP()
 
     with torch.no_grad():
-        for images, targets in tqdm(val_loader, desc=f"Validazione {format_name}"):
+        for images, targets in tqdm(val_loader, desc=f"Inferenza {format_name}"):
             if is_onnx:
-                img_np = images[0].unsqueeze(0).numpy()
-                boxes, labels, scores = session.run(None, {input_name: img_np})
-                preds = [{"boxes": torch.tensor(boxes), "scores": torch.tensor(scores),
-                          "labels": torch.tensor(labels, dtype=torch.int64)}]
+                img_np  = _resize_tensor(images[0])
+                boxes_np, labels_np, scores_np = session.run(None, {input_name: img_np})
+                preds = [{
+                    'boxes':  torch.from_numpy(boxes_np),
+                    'scores': torch.from_numpy(scores_np),
+                    'labels': torch.from_numpy(labels_np).to(torch.int64),
+                }]
             else:
-                images_cuda = [img.to(device) for img in images]
-                out = model(images_cuda)
-                preds = [{"boxes": out[0]['boxes'].cpu(), "scores": out[0]['scores'].cpu(),
-                          "labels": out[0]['labels'].cpu()}]
+                imgs_dev = [T.functional.resize(images[0], [FIXED_INPUT_SIZE[0], FIXED_INPUT_SIZE[1]]).to(device)]
+                out      = model(imgs_dev)
+                preds    = [{k: v.cpu() for k, v in out[0].items()}]
 
             targets_cpu = [{k: v.cpu() for k, v in t.items()} for t in targets]
             metric.update(preds, targets_cpu)
 
-    map_50 = metric.compute()['map_50'].item() * 100
+    results = metric.compute()
+    map_50  = results['map_50'].item() * 100
 
-    # --- REPORT FINALE ---
-    print("\n" + "=" * 60)
-    print(f" RISULTATI: {format_name}")
-    print(f" [1] Accuratezza (mAP@50): {map_50:.2f} %")
-    print(f" [2] Latenza Media       : {avg_latency_ms:.2f} ms")
-    print(f" [3] Throughput          : {fps:.2f} FPS")
-    print(f" [4] RAM Allocata        : ~{ram_peak_mb:.2f} MB")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print(f"  RISULTATI  —  {format_name}  ({hw_name})")
+    print(f"  mAP@50        : {map_50:.2f} %")
+    print(f"  Latenza media : {avg_latency_ms:.2f} ms/img")
+    print(f"  Throughput    : {fps:.2f} FPS")
+    print(f"  RAM processo  : {ram_mb:.1f} MB")
+    print(f"  CPU overhead  : {cpu_pct:.1f} %")
+    print(f"  Inf/Watt      : {inf_per_watt:.3f}  (TDP={tdp_w} W)")
+    print("=" * 65)
 
 
 if __name__ == "__main__":
-    DATA_ROOT = "../data/neu-det"
-
-    # Scelta:
-    MODEL_PATH = "../models/quantized/faster_rcnn_baseline_shaped.onnx"
-    # MODEL_PATH = "../models/baseline/faster_rcnn_baseline.pth"
+    # Aggiorna questi percorsi in base alla tua cartella se necessario
+    DATA_ROOT  = "../data/neu-det"
+    MODEL_PATH = "../models/quantized/best_model_shaped.onnx"
 
     run_benchmark(MODEL_PATH, DATA_ROOT)

@@ -15,3 +15,5 @@ paho-mqtt
 openvino
 openvino-dev
 kinara-runtime
+ultralytics
+optuna
