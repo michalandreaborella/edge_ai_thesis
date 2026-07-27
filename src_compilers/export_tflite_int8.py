@@ -10,7 +10,7 @@ def representative_dataset_gen():
     La quantizzazione INT8 HA BISOGNO di dati reali per calibrare le attivazioni
     e calcolare i valori Min/Max per lo scaling dei tensori.
     """
-    image_folder = "../data/neu-det/validation/images/"
+    image_folder = "../data/neu-det/val/images/"
     # Prendo le prime 50 immagini per la calibrazione
     image_files = [f for f in os.listdir(image_folder) if f.endswith('.jpg')][:50]
 

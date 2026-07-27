@@ -157,7 +157,7 @@ def evaluate_with_metrics(model, data_loader, device):
 def main():
     print(f"[*] Hardware in uso: {Config.DEVICE}")
     train_dataset = NEUDETDataset(Config.DATA_ROOT, split='train', transforms=get_transform(train=True))
-    val_dataset = NEUDETDataset(Config.DATA_ROOT, split='validation', transforms=get_transform(train=False))
+    val_dataset = NEUDETDataset(Config.DATA_ROOT, split='val', transforms=get_transform(train=False))
 
     train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=Config.NUM_WORKERS,
                               collate_fn=collate_fn)
