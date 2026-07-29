@@ -1,5 +1,4 @@
 # Modelli e dati
-models/
 data/
 results/
 
@@ -13,3 +12,10 @@ __pycache__/
 
 # IDE
 .idea/
+
+models/
+*.pt
+*.pth
+*.onnx
+*.h5
+*.ckpt
